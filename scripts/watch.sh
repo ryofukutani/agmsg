@@ -230,68 +230,13 @@ if [ -z "$PAIRS" ]; then
   exit 0
 fi
 
-# Per-(team,agent) cursors. Each team's store has its own position sequence
-# (sqlite message id / jsonl line number), and a session may span teams on
-# different stores, so we track a cursor PER PAIR rather than one global
-# watermark. The storage-specific watch logic lives in the driver
-# (storage_watch_tip / storage_watch_after); this script only dispatches per
-# team. Cursors are persisted per session_id so a *restart* resumes from the
-# last delivered position per pair and drops nothing that arrived during the gap
-# (#107). A *fresh* pair starts at the store's current tip — live push, no
-# replay. bash 3.2 has no associative arrays — parallel indexed arrays + linear
-# lookup (pair counts are tiny).
-CURSOR_FILE="$RUN_DIR/watch.$SESSION_ID.cursors"
-PAIR_KEYS=()    # each entry: "<team>\t<agent>"
-PAIR_CURS=()    # parallel: the pair's cursor
-
-_cursor_index() {
-  local i=0 k
-  for k in ${PAIR_KEYS[@]+"${PAIR_KEYS[@]}"}; do
-    [ "$k" = "$1" ] && { printf '%s' "$i"; return; }
-    i=$((i + 1))
-  done
-  printf '%s' "-1"
-}
-_cursor_get() { local i; i="$(_cursor_index "$1")"; [ "$i" -ge 0 ] && printf '%s' "${PAIR_CURS[$i]}"; }
-_cursor_set() {
-  local i; i="$(_cursor_index "$1")"
-  if [ "$i" -ge 0 ]; then PAIR_CURS[$i]="$2"; else PAIR_KEYS+=("$1"); PAIR_CURS+=("$2"); fi
-}
-persist_cursors() {
-  local i=0
-  : > "$CURSOR_FILE" 2>/dev/null || return 0
-  while [ "$i" -lt "${#PAIR_KEYS[@]}" ]; do
-    printf '%s\t%s\n' "${PAIR_KEYS[$i]}" "${PAIR_CURS[$i]}" >> "$CURSOR_FILE" 2>/dev/null || true
-    i=$((i + 1))
-  done
-}
-
+# The read cursor lives in the STORE, per (team, agent), shared with inbox and
+# resolved via the driver (storage_get_cursor / storage_consume). A restart
+# resumes from it automatically (#107) and a fresh watcher delivers whatever is
+# unread past the cursor (aligned with inbox — no separate per-session watermark
+# and no "jump to MAX" that would hide unread history). The driver owns the
+# storage-specific watch (storage_watch_after / storage_consume).
 TAB="$(printf '\t')"
-
-# Restore persisted cursors (restart-resume). File lines: "<team>\t<agent>\t<cursor>".
-if [ -f "$CURSOR_FILE" ]; then
-  while IFS="$TAB" read -r _ct _ca _cc; do
-    [ -z "$_ct" ] && continue
-    case "$_cc" in ''|*[!0-9]*) continue ;; esac
-    _cursor_set "${_ct}${TAB}${_ca}" "$_cc"
-  done < "$CURSOR_FILE"
-fi
-
-# Initialize any pair without a persisted cursor to its store's current tip.
-while IFS="$TAB" read -r team agent; do
-  [ -z "$team" ] && continue
-  _ckey="${team}${TAB}${agent}"
-  if [ -z "$(_cursor_get "$_ckey")" ]; then
-    if agmsg_storage_load "$team" 2>/dev/null; then
-      _tip="$(storage_watch_tip "$team" 2>/dev/null || echo 0)"
-    else
-      _tip=0
-    fi
-    case "$_tip" in ''|*[!0-9]*) _tip=0 ;; esac
-    _cursor_set "$_ckey" "$_tip"
-  fi
-done <<< "$PAIRS"
-persist_cursors
 
 # DB-open healthcheck (#197). The main loop guards every query with
 # `2>/dev/null || true`, so when sqlite3 cannot open the store the watcher keeps
@@ -346,8 +291,7 @@ while true; do
     [ -z "$team" ] && continue
     agmsg_storage_load "$team" 2>/dev/null || continue
     storage_exists "$team" || continue
-    _ckey="${team}${TAB}${agent}"
-    cur="$(_cursor_get "$_ckey")"; case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+    cur="$(storage_get_cursor "$team" "$agent" 2>/dev/null || echo 0)"; case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
     ROWS="$(storage_watch_after "$team" "$agent" "$cur" 2>/dev/null || true)"
     [ -n "$ROWS" ] || continue
     while IFS=$'\x1f' read -r pos ts rtm from to body; do
@@ -357,7 +301,7 @@ while true; do
       # lock + registration) then close our own tmux pane, which also ends the
       # agent CLI. Deterministic teardown, no dependence on the LLM. See #109.
       if [ "$body" = "ctrl:despawn" ]; then
-        _cursor_set "$_ckey" "$pos"; persist_cursors
+        storage_consume "$team" "$agent" "$pos"
         # Only an EXCLUSIVE watcher dedicated to exactly this role tears itself
         # down. A broad-subscription watcher (e.g. a leader subscribing to every
         # project role) must NOT act on it — its $TMUX_PANE is the leader's own
@@ -377,8 +321,10 @@ while true; do
         cleanup
         exit 0
       fi
-      _cursor_set "$_ckey" "$pos"
-      persist_cursors
+      # Consume up to this delivered position: advance the cursor + write the
+      # read record. Only after a SUCCESSFUL emit, so a closed stdout / dead
+      # session never records past an undelivered message (#67).
+      storage_consume "$team" "$agent" "$pos"
     done <<< "$ROWS"
   done <<< "$PAIRS"
 

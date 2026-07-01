@@ -62,6 +62,28 @@ UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
 " 2>/dev/null || true
 }
 
+# storage_consume <team> <agent> <pos> — mark everything up to <pos> consumed:
+# advance the read cursor (forward only) AND write the persistent read record
+# (append-only message_read events + read_at) for messages up to <pos>. Bounded
+# by <pos> (not a bulk "mark all unread") so the watcher never records past a
+# message it has not actually delivered (#67).
+storage_consume() {
+  local team="$1" agent="$2" pos="$3" db tl al
+  db="$(agmsg_team_db_path "$team")"
+  [ -f "$db" ] || return 0
+  case "$pos" in ''|*[!0-9]*) return 0 ;; esac
+  tl="$(agmsg_sqlesc "$team")"; al="$(agmsg_sqlesc "$agent")"
+  agmsg_sqlite "$db" "
+    INSERT INTO events (type, team, agent, msg_id)
+      SELECT 'message_read', team, to_agent, id FROM messages
+      WHERE team='$tl' AND to_agent='$al' AND id<=$pos AND read_at IS NULL;
+    UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE team='$tl' AND to_agent='$al' AND id<=$pos AND read_at IS NULL;
+    INSERT INTO cursors (team, agent, pos) VALUES ('$tl', '$al', $pos)
+      ON CONFLICT(team,agent) DO UPDATE SET pos=excluded.pos WHERE excluded.pos > cursors.pos;
+  " 2>/dev/null || true
+}
+
 # storage_get_cursor <team> <agent> — the read cursor (unread boundary), 0 if none.
 storage_get_cursor() {
   local team="$1" agent="$2" db tl al

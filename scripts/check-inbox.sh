@@ -150,9 +150,8 @@ for team in "${TEAM_LIST[@]}"; do
       LASTPOS="$pos"
     done <<< "$RESULT"
     OUTPUT+=$'\n'
-    # Advance the cursor + write the persistent read record (events + read_at).
-    storage_set_cursor "$team" "$AGENT" "$LASTPOS"
-    storage_mark_read "$team" "$AGENT"
+    # Mark up to the last shown message consumed (cursor + read record).
+    storage_consume "$team" "$AGENT" "$LASTPOS"
   fi
 done
 

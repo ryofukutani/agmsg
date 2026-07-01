@@ -68,9 +68,9 @@ if [ -f "$PIDFILE" ]; then
   rm -f "$PIDFILE"
 fi
 
-# Drop the per-session stream cursors (see #107) — the session is ending, so
-# there is no restart to resume; a future session_id reuse should start fresh.
-rm -f "$RUN_DIR/watch.$INSTANCE_ID.cursors" 2>/dev/null || true
+# The read cursor lives in the store (per team,agent) and is intentionally NOT
+# cleared on session end — a future session resumes from what has been consumed.
+# Nothing else is keyed per-session here (the pidfile is handled above).
 
 # Clean the cc-instance entry that points at this instance id. The enclosing
 # CC process may itself be exiting (matcher=logout/etc.), in which case its

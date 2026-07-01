@@ -53,11 +53,13 @@ _max_message_id() {
     agmsg_sqlite "$(agmsg_db_path)" "SELECT COALESCE(MAX(id), 0) FROM messages;" )
 }
 
-# Cursor for a (team, agent) pair from a watcher's .cursors file (lines are
-# "<team>\t<agent>\t<cursor>"). Per-pair cursors replaced the old single-int
-# watermark file (#107) when storage went per-team.
-_pair_cursor() {
-  awk -F'\t' -v t="$2" -v a="$3" '$1==t && $2==a {print $3}' "$1"
+# The read cursor for a (team, agent) now lives IN the store (shared with
+# inbox), not a per-session file. Read it through the driver.
+_store_cursor() {
+  ( # shellcheck disable=SC1090
+    source "$SCRIPTS/lib/storage.sh"
+    agmsg_storage_load "$1" 2>/dev/null
+    storage_get_cursor "$1" "$2" )
 }
 
 _wait_for_file() {
@@ -114,29 +116,20 @@ _wait_for_file_contains() {
   ! grep -q "M1-before-stop" "$TEST_SKILL_DIR/out2.log"
 }
 
-@test "watch: a fresh session starts from now and does not replay history" {
+@test "watch: delivers unread past the cursor; a later watcher does not re-deliver consumed" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
-  # Pre-existing message before any watcher for this session ever runs.
-  bash "$SCRIPTS/send.sh" team bob alice "M0-history" >/dev/null
+  # Unified model: unread = messages past the shared read cursor. A message
+  # already sitting unread when a watcher starts IS delivered (aligned with
+  # inbox) — no "jump to MAX" that would hide it. Consuming it advances the
+  # store cursor, so a later watcher for the same (team, agent) does not replay.
+  bash "$SCRIPTS/send.sh" team bob alice "M0-unread" >/dev/null
+  run_watcher_for "sess-fresh" "$TEST_SKILL_DIR/fresh1.log" 2
+  grep -q "M0-unread" "$TEST_SKILL_DIR/fresh1.log"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-fresh" "$PROJ" claude-code \
-    >"$TEST_SKILL_DIR/fresh.log" 2>/dev/null 3>&- &
-  local w=$!
-  sleep 1.5
   bash "$SCRIPTS/send.sh" team bob alice "M-live" >/dev/null
-  sleep 2
-  kill "$w" 2>/dev/null || true
-  wait "$w" 2>/dev/null || true
-
-  # Live message after attach is delivered; pre-existing history is not replayed.
-  grep -q "M-live" "$TEST_SKILL_DIR/fresh.log"
-  ! grep -q "M0-history" "$TEST_SKILL_DIR/fresh.log"
-}
-
-@test "watch: persists a cursors file for the session" {
-  skip_on_windows "watcher background launch under Git Bash (#182)"
-  run_watcher_for "sess-wm" "$TEST_SKILL_DIR/wm.log" 1.5
-  [ -f "$TEST_SKILL_DIR/run/watch.$(_iid sess-wm).cursors" ]
+  run_watcher_for "sess-fresh2" "$TEST_SKILL_DIR/fresh2.log" 2
+  grep -q "M-live" "$TEST_SKILL_DIR/fresh2.log"
+  ! grep -q "M0-unread" "$TEST_SKILL_DIR/fresh2.log"
 }
 
 @test "watch: exits within one interval when its session dies, without advancing the watermark past an undelivered row (#67)" {
@@ -158,18 +151,15 @@ _wait_for_file_contains() {
   # arrived while the watcher was down".
   local sesspid; sleep 600 & sesspid=$!
   local iid="sess-liveness.$sesspid"
-  local wm="$TEST_SKILL_DIR/run/watch.$iid.cursors"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
   local out="$TEST_SKILL_DIR/liveness-delivery.log"
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   local w=$!
-  # Wait for the watermark file, not just the pidfile: the pidfile is written
-  # early (before the subscription is resolved and LAST is seeded), so sending a
-  # message right after it appears would race the seed and the row would land at
-  # or below the initial watermark and never be "new". The watermark file is
-  # written once the watcher is ready to receive.
-  _wait_for_file "$wm"
+  # Wait for the watcher process (pidfile). Unlike the old watermark model there
+  # is no seed race to wait past: a message sent before the first poll is unread
+  # (past the store cursor, which starts at 0) and is delivered on that poll.
+  _wait_for_file "$pf"
   [ -f "$pf" ]
 
   bash "$SCRIPTS/send.sh" team bob alice "M1-delivered" >/dev/null
@@ -187,7 +177,7 @@ _wait_for_file_contains() {
   _wait_for_missing "$pf" || { kill "$w" 2>/dev/null || true; false; }
   run kill -0 "$w"; [ "$status" -ne 0 ]
   [ "$first_id" != "$second_id" ]
-  [ "$(_pair_cursor "$wm" team alice)" = "$first_id" ]
+  [ "$(_store_cursor team alice)" = "$first_id" ]
   ! grep -q "M2-undelivered" "$out"
 }
 
@@ -195,16 +185,14 @@ _wait_for_file_contains() {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local sid="sess-stdout-closed"
   local iid="$(_iid "$sid")"
-  local wm="$TEST_SKILL_DIR/run/watch.$iid.cursors"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
     1>&- 2>/dev/null 3>&- &
   local w=$!
 
-  _wait_for_file "$wm"
-  [ -f "$pf" ]
-  local initial="$(_pair_cursor "$wm" team alice)"
+  _wait_for_file "$pf"
+  local initial="$(_store_cursor team alice)"
 
   bash "$SCRIPTS/send.sh" team bob alice "M-after-closed-stdout" >/dev/null
 
@@ -215,19 +203,10 @@ _wait_for_file_contains() {
   }
   wait "$w" 2>/dev/null || true
 
-  [ "$(_pair_cursor "$wm" team alice)" = "$initial" ]
+  [ "$(_store_cursor team alice)" = "$initial" ]
 
   run_watcher_for "$sid" "$TEST_SKILL_DIR/closed-redelivery.log" 2
   grep -q "M-after-closed-stdout" "$TEST_SKILL_DIR/closed-redelivery.log"
-}
-
-@test "session-end: removes the session cursors file" {
-  # Key the cursors file under the same instance id session-end will derive.
-  local wm="$TEST_SKILL_DIR/run/watch.$(_iid sess-end).cursors"
-  mkdir -p "$TEST_SKILL_DIR/run"
-  printf 'team\talice\t5\n' > "$wm"
-  printf '{"session_id":"sess-end"}' | bash "$SCRIPTS/session-end.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
-  [ ! -f "$wm" ]
 }
 
 @test "watch: actas-mode watcher creates a ready sentinel and removes it on exit" {
@@ -319,24 +298,20 @@ _wait_for_file_contains() {
   wait "$wpid" 2>/dev/null || true
 }
 
-@test "session-start: GCs stale cursors/ready but keeps live ones" {
+@test "session-start: GCs a stale ready sentinel but keeps a live one" {
   skip_on_windows "watcher live-owner liveness under Git Bash (#182)"
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
   # Stale (owner has no live cc-instance).
-  printf 'team\talice\t5\n' > "$TEST_SKILL_DIR/run/watch.deadsid.cursors"
   echo deadsid > "$TEST_SKILL_DIR/run/ready.team__ghost"
   # Live owner.
   setup_live_owner "$TEST_SKILL_DIR/run" LIVESID
-  printf 'team\talice\t7\n' > "$TEST_SKILL_DIR/run/watch.LIVESID.cursors"
   echo LIVESID > "$TEST_SKILL_DIR/run/ready.team__live"
 
   printf '{"session_id":"somesess"}' \
     | bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" >/dev/null 2>&1 || true
 
-  [ ! -f "$TEST_SKILL_DIR/run/watch.deadsid.cursors" ]
   [ ! -f "$TEST_SKILL_DIR/run/ready.team__ghost" ]
-  [ -f "$TEST_SKILL_DIR/run/watch.LIVESID.cursors" ]
   [ -f "$TEST_SKILL_DIR/run/ready.team__live" ]
 }
 
@@ -446,11 +421,11 @@ _wait_pidfile() {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local sid="sess-burst"
   local out="$TEST_SKILL_DIR/burst.log"
-  local wm="$TEST_SKILL_DIR/run/watch.$(_iid "$sid").cursors"
+  local pf="$TEST_SKILL_DIR/run/watch.$(_iid "$sid").pid"
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null &
   local w=$!
-  _wait_for_file "$wm"          # ready to receive (cursors seeded)
+  _wait_for_file "$pf"          # watcher process up (unread burst delivered on poll)
 
   local n
   for n in 1 2 3 4 5 6 7 8; do

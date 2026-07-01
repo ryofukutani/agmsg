@@ -46,8 +46,7 @@ while IFS=$'\x1f' read -r pos ts _team from to body; do
 done <<< "$UNREAD"
 echo ""
 
-# Advance the read cursor (the unread boundary) and write the persistent read
-# record (append-only message_read events + read_at) for back-compat / history.
+# Mark everything up to the last shown message consumed: advance the read cursor
+# (unread boundary) and write the persistent read record (events + read_at).
 # Non-fatal — may fail in sandboxed environments.
-storage_set_cursor "$TEAM" "$AGENT" "$LASTPOS"
-storage_mark_read "$TEAM" "$AGENT"
+storage_consume "$TEAM" "$AGENT" "$LASTPOS"
