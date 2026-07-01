@@ -144,6 +144,15 @@ storage_import() {
     [ "${readn:-0}" -gt 0 ] && ra="'$(agmsg_sqlesc "$at")'"
     agmsg_sqlite "$db" "INSERT INTO messages (team,from_agent,to_agent,body,created_at,read_at) VALUES ('$(agmsg_sqlesc "$team")','$(agmsg_sqlesc "$from")','$(agmsg_sqlesc "$to")','$(agmsg_sqlesc "$body")','$(agmsg_sqlesc "$at")', $ra);"
   done
+  # Reconstruct read cursors in THIS store's position space (ids are new here):
+  # each agent's unread boundary = the highest id it has already read.
+  local tl; tl="$(agmsg_sqlesc "$team")"
+  agmsg_sqlite "$db" "
+    INSERT INTO cursors (team, agent, pos)
+      SELECT '$tl', to_agent, MAX(id) FROM messages
+      WHERE team='$tl' AND read_at IS NOT NULL GROUP BY to_agent
+    ON CONFLICT(team,agent) DO UPDATE SET pos=excluded.pos;
+  " 2>/dev/null || true
 }
 
 # storage_purge <team> — remove this team's data from the CURRENT store. On the

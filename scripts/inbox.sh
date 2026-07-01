@@ -23,7 +23,10 @@ if ! storage_exists "$TEAM"; then
   exit 0
 fi
 
-UNREAD=$(storage_list_unread "$TEAM" "$AGENT")
+# Unread = messages past the read cursor (the same cursor the monitor watcher
+# uses). Records are <pos> <US> <ts> <US> <team> <US> <from> <US> <to> <US> <body>.
+CUR=$(storage_get_cursor "$TEAM" "$AGENT")
+UNREAD=$(storage_watch_after "$TEAM" "$AGENT" "$CUR")
 
 if [ -z "$UNREAD" ]; then
   if [ "$QUIET" = true ]; then exit 0; fi
@@ -31,15 +34,20 @@ if [ -z "$UNREAD" ]; then
   exit 0
 fi
 
-# Display
+# Display, tracking the last delivered position.
 COUNT=$(echo "$UNREAD" | wc -l | tr -d ' ')
 echo "$COUNT new message(s):"
 echo ""
-while IFS=$'\x1f' read -r from body ts; do
+LASTPOS="$CUR"
+while IFS=$'\x1f' read -r pos ts _team from to body; do
+  [ -z "$pos" ] && continue
   echo "  [$ts] $from: $body"
+  LASTPOS="$pos"
 done <<< "$UNREAD"
 echo ""
 
-# Mark as read (non-fatal — may fail in sandboxed environments). The driver
-# dual-writes: append-only message_read events + read_at for back-compat.
+# Advance the read cursor (the unread boundary) and write the persistent read
+# record (append-only message_read events + read_at) for back-compat / history.
+# Non-fatal — may fail in sandboxed environments.
+storage_set_cursor "$TEAM" "$AGENT" "$LASTPOS"
 storage_mark_read "$TEAM" "$AGENT"

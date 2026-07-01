@@ -135,18 +135,23 @@ for team in "${TEAM_LIST[@]}"; do
     other:*) continue ;;
   esac
 
-  # Read unread + mark through the team's storage backend (sqlite default).
+  # Unread = messages past the read cursor (shared with the monitor watcher).
   agmsg_storage_load "$team"
   storage_exists "$team" || continue
-  RESULT=$(storage_list_unread "$team" "$AGENT")
+  CUR=$(storage_get_cursor "$team" "$AGENT")
+  RESULT=$(storage_watch_after "$team" "$AGENT" "$CUR")
   if [ -n "$RESULT" ]; then
     COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
     OUTPUT+="$COUNT new message(s) in $team:"$'\n'
-    while IFS=$'\x1f' read -r from body ts; do
+    LASTPOS="$CUR"
+    while IFS=$'\x1f' read -r pos ts _team from to body; do
+      [ -z "$pos" ] && continue
       OUTPUT+="  [$ts] $from: $body"$'\n'
+      LASTPOS="$pos"
     done <<< "$RESULT"
     OUTPUT+=$'\n'
-    # Mark read — the driver dual-writes append-only events + read_at.
+    # Advance the cursor + write the persistent read record (events + read_at).
+    storage_set_cursor "$team" "$AGENT" "$LASTPOS"
     storage_mark_read "$team" "$AGENT"
   fi
 done
