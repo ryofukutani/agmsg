@@ -69,3 +69,13 @@ CREATE TABLE IF NOT EXISTS cursors (
   PRIMARY KEY (team, agent)
 );
 SQL
+
+# Stamp a FRESH (empty) store as already at the current schema/data version so it
+# skips the upgrade-only migrations in storage_ensure_schema — otherwise its very
+# first message would be swept up by migration #1's "consume the backlog" step. A
+# pre-versioning store left by an older release keeps user_version 0 (it has
+# messages) and is migrated on first load. Keep in sync with _SQLITE_SCHEMA_VERSION.
+if [ "$(agmsg_sqlite "$DB" "PRAGMA user_version;" 2>/dev/null)" = "0" ] \
+   && [ "$(agmsg_sqlite "$DB" "SELECT COUNT(*) FROM messages;" 2>/dev/null)" = "0" ]; then
+  agmsg_sqlite "$DB" "PRAGMA user_version=1;" 2>/dev/null || true
+fi

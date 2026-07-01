@@ -181,23 +181,27 @@ teardown() {
   [ "$(storage_get_cursor jc bob)" = "12" ]
 }
 
-@test "storage migration: seeds the cursor from existing read_at (no re-delivery on upgrade)" {
+@test "storage migration: upgrade consumes the backlog and never re-delivers it" {
   source "$SCRIPTS/lib/storage.sh"
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
-  # Simulate a pre-migration store an older version left behind: messages already
-  # read (read_at set), but no cursor and user_version 0.
+  # Simulate a pre-migration store an older version left behind: a MIX of an
+  # inbox-read message (read_at set) AND a monitor-delivered one (read_at NULL —
+  # the old monitor never set read_at), no cursor, user_version 0.
   bash "$SCRIPTS/internal/init-db.sh" >/dev/null
   local db="$AGMSG_STORAGE_PATH/messages.db"
   sqlite3 "$db" "INSERT INTO messages (team,from_agent,to_agent,body,read_at) VALUES
-    ('t','a','bob','old1','2026-01-01T00:00:00Z'),
-    ('t','a','bob','old2','2026-01-01T00:00:01Z');"
+    ('t','a','bob','turn-read','2026-01-01T00:00:00Z');
+    INSERT INTO messages (team,from_agent,to_agent,body) VALUES
+    ('t','a','bob','monitor-delivered');"
   sqlite3 "$db" "DELETE FROM cursors; PRAGMA user_version=0;"
 
-  # First new-version read: the migration seeds the cursor from read_at, so the
-  # already-read history is NOT re-delivered.
+  # First new-version read: the migration treats the WHOLE backlog as consumed
+  # (cursor -> tip), so neither the read nor the monitor-delivered message is
+  # re-delivered — no storm.
   run bash "$SCRIPTS/inbox.sh" t bob
   [ "$status" -eq 0 ]
   [[ "$output" =~ "No new messages" ]]
+  [[ ! "$output" =~ "monitor-delivered" ]]
   [ "$(sqlite3 "$db" "PRAGMA user_version;")" = "1" ]
   [ "$(sqlite3 "$db" "SELECT pos FROM cursors WHERE team='t' AND agent='bob';")" = "2" ]
 

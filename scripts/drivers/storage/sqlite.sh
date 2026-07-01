@@ -81,15 +81,21 @@ storage_ensure_schema() {
   # current schema exists (idempotent) before migrating data into it.
   bash "$(agmsg_skill_dir)/scripts/internal/init-db.sh" "$team" >/dev/null 2>&1 || true
 
-  # --- migration #1: seed the read cursor from the existing read_at boundary ---
-  # Without this, the cursor model (unread = past cursor) would treat all
-  # already-read history (read_at set, cursor still 0) as unread and re-deliver
-  # it on the first new-version run. cursor(agent) = highest id it has read.
+  # --- migration #1: adopt the cursor model without re-delivering the backlog ---
+  # An upgrading store's existing messages were already delivered by the prior
+  # version. read_at alone under-counts that: the monitor watcher delivered
+  # messages WITHOUT setting read_at (only inbox/check-inbox set it), so a
+  # read_at-based seed would leave the whole monitor-delivered backlog looking
+  # unread and re-stream it on upgrade. So treat the entire existing backlog as
+  # consumed: mark it read (record consistency) and start each agent's cursor at
+  # the current tip. Trade-off: a message genuinely in flight at the exact
+  # upgrade instant is not re-surfaced (bounded); avoiding a full-history
+  # re-delivery storm dominates. A fresh (empty) store is a no-op here.
   if [ "$v" -lt 1 ]; then
     agmsg_sqlite "$db" "
+      UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE read_at IS NULL;
       INSERT INTO cursors (team, agent, pos)
-        SELECT team, to_agent, MAX(id) FROM messages
-        WHERE read_at IS NOT NULL GROUP BY team, to_agent
+        SELECT team, to_agent, MAX(id) FROM messages GROUP BY team, to_agent
       ON CONFLICT(team,agent) DO UPDATE SET pos=excluded.pos WHERE excluded.pos > cursors.pos;
     " 2>/dev/null || true
   fi
