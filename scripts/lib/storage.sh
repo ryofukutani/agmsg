@@ -169,6 +169,21 @@ agmsg_storage_load() {
     # shellcheck disable=SC1090
     . "$file"
     _AGMSG_LOADED_DRIVER="$name"
+    # Apply pending schema/data migrations for this store, once per (driver,team)
+    # per process. Version-gated inside the driver, so this is a cheap no-op once
+    # the store is current. Lazy migration means every store (global, per-team,
+    # existing or future) is brought up to date on first use — no install-time
+    # enumeration needed.
+    local _mkey="$name/$team"
+    case " ${_AGMSG_ENSURED:-} " in
+      *" $_mkey "*) ;;
+      *)
+        if command -v storage_ensure_schema >/dev/null 2>&1; then
+          storage_ensure_schema "$team" 2>/dev/null || true
+        fi
+        _AGMSG_ENSURED="${_AGMSG_ENSURED:-} $_mkey"
+        ;;
+    esac
     return 0
   done < <(agmsg_driver_bases)
   echo "agmsg: no trusted storage driver '$name' found" >&2

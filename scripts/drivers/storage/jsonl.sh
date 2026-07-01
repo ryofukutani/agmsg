@@ -75,6 +75,25 @@ storage_mark_read() {
   done
 }
 
+# Current jsonl schema/data version. Bump when adding a migration step.
+_JSONL_SCHEMA_VERSION=1
+
+# storage_ensure_schema <team> — version-gated migration, mirroring the sqlite
+# driver. The jsonl backend is new (no pre-existing stores) and its read-state
+# is already event-based with the cursor written on consume, so there is no data
+# to back-fill yet; this just records the version. Gated by a .schema-version
+# file so it runs once.
+storage_ensure_schema() {
+  local team="$1" dir vf v
+  dir="$(agmsg_team_storage_dir "$team")"
+  [ -d "$dir" ] || return 0
+  vf="$dir/.schema-version"
+  v=0; [ -f "$vf" ] && v="$(cat "$vf" 2>/dev/null || echo 0)"
+  case "$v" in ''|*[!0-9]*) v=0 ;; esac
+  [ "$v" -ge "$_JSONL_SCHEMA_VERSION" ] && return 0
+  printf '%s\n' "$_JSONL_SCHEMA_VERSION" > "$vf" 2>/dev/null || true
+}
+
 # storage_consume <team> <agent> <pos> — mark everything up to <pos> consumed:
 # append message_read events for messages on lines <= <pos> to <agent> not yet
 # read, then advance the read cursor (forward only). Bounded by <pos> so the

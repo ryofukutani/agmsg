@@ -62,6 +62,41 @@ UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
 " 2>/dev/null || true
 }
 
+# Current sqlite schema/data version. Bump when adding a migration step below.
+_SQLITE_SCHEMA_VERSION=1
+
+# storage_ensure_schema <team> — bring an existing store up to the current schema
+# version, applying pending DATA migrations. Gated by PRAGMA user_version so it
+# runs once and never double-applies; called lazily on store load. A fresh store
+# runs the (no-op-on-empty) migrations and lands at the current version.
+storage_ensure_schema() {
+  local team="$1" db v
+  db="$(agmsg_team_db_path "$team")"
+  [ -f "$db" ] || return 0
+  v="$(agmsg_sqlite "$db" "PRAGMA user_version;" 2>/dev/null || echo 0)"
+  case "$v" in ''|*[!0-9]*) v=0 ;; esac
+  [ "$v" -ge "$_SQLITE_SCHEMA_VERSION" ] && return 0
+
+  # A pre-migration store may predate the events/cursors tables — ensure the
+  # current schema exists (idempotent) before migrating data into it.
+  bash "$(agmsg_skill_dir)/scripts/internal/init-db.sh" "$team" >/dev/null 2>&1 || true
+
+  # --- migration #1: seed the read cursor from the existing read_at boundary ---
+  # Without this, the cursor model (unread = past cursor) would treat all
+  # already-read history (read_at set, cursor still 0) as unread and re-deliver
+  # it on the first new-version run. cursor(agent) = highest id it has read.
+  if [ "$v" -lt 1 ]; then
+    agmsg_sqlite "$db" "
+      INSERT INTO cursors (team, agent, pos)
+        SELECT team, to_agent, MAX(id) FROM messages
+        WHERE read_at IS NOT NULL GROUP BY team, to_agent
+      ON CONFLICT(team,agent) DO UPDATE SET pos=excluded.pos WHERE excluded.pos > cursors.pos;
+    " 2>/dev/null || true
+  fi
+
+  agmsg_sqlite "$db" "PRAGMA user_version=$_SQLITE_SCHEMA_VERSION;" 2>/dev/null || true
+}
+
 # storage_consume <team> <agent> <pos> — mark everything up to <pos> consumed:
 # advance the read cursor (forward only) AND write the persistent read record
 # (append-only message_read events + read_at) for messages up to <pos>. Bounded

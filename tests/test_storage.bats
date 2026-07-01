@@ -181,6 +181,32 @@ teardown() {
   [ "$(storage_get_cursor jc bob)" = "12" ]
 }
 
+@test "storage migration: seeds the cursor from existing read_at (no re-delivery on upgrade)" {
+  source "$SCRIPTS/lib/storage.sh"
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
+  # Simulate a pre-migration store an older version left behind: messages already
+  # read (read_at set), but no cursor and user_version 0.
+  bash "$SCRIPTS/internal/init-db.sh" >/dev/null
+  local db="$AGMSG_STORAGE_PATH/messages.db"
+  sqlite3 "$db" "INSERT INTO messages (team,from_agent,to_agent,body,read_at) VALUES
+    ('t','a','bob','old1','2026-01-01T00:00:00Z'),
+    ('t','a','bob','old2','2026-01-01T00:00:01Z');"
+  sqlite3 "$db" "DELETE FROM cursors; PRAGMA user_version=0;"
+
+  # First new-version read: the migration seeds the cursor from read_at, so the
+  # already-read history is NOT re-delivered.
+  run bash "$SCRIPTS/inbox.sh" t bob
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "No new messages" ]]
+  [ "$(sqlite3 "$db" "PRAGMA user_version;")" = "1" ]
+  [ "$(sqlite3 "$db" "SELECT pos FROM cursors WHERE team='t' AND agent='bob';")" = "2" ]
+
+  # A message sent AFTER the upgrade is still delivered.
+  bash "$SCRIPTS/send.sh" t a bob "new-after-upgrade"
+  run bash "$SCRIPTS/inbox.sh" t bob
+  [[ "$output" =~ "new-after-upgrade" ]]
+}
+
 @test "storage migrate: carries messages + read-state to jsonl and purges the source" {
   if ! command -v jq >/dev/null 2>&1; then skip "jq not installed"; fi
   source "$SCRIPTS/lib/storage.sh"
