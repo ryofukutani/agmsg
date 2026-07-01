@@ -56,4 +56,16 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_read ON events(type, team, agent, msg_id);
+
+-- Per-(team,agent) read cursor: the unread boundary (highest consumed message
+-- position). Unread = messages to the agent past this cursor; inbox and the
+-- monitor watcher share it. Advanced on consume; the append-only events log
+-- above remains the persistent per-message read record (history / external
+-- tools), so this cursor is the fast operational boundary, not the audit trail.
+CREATE TABLE IF NOT EXISTS cursors (
+  team  TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  pos   INTEGER NOT NULL,
+  PRIMARY KEY (team, agent)
+);
 SQL

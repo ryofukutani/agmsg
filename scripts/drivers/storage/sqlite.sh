@@ -62,6 +62,29 @@ UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')
 " 2>/dev/null || true
 }
 
+# storage_get_cursor <team> <agent> — the read cursor (unread boundary), 0 if none.
+storage_get_cursor() {
+  local team="$1" agent="$2" db tl al
+  db="$(agmsg_team_db_path "$team")"
+  [ -f "$db" ] || { echo 0; return 0; }
+  tl="$(agmsg_sqlesc "$team")"; al="$(agmsg_sqlesc "$agent")"
+  agmsg_sqlite "$db" "SELECT COALESCE((SELECT pos FROM cursors WHERE team='$tl' AND agent='$al'), 0);" 2>/dev/null || echo 0
+}
+
+# storage_set_cursor <team> <agent> <pos> — persist the read cursor.
+storage_set_cursor() {
+  local team="$1" agent="$2" pos="$3" db init tl al
+  db="$(agmsg_team_db_path "$team")"
+  init="$(agmsg_skill_dir)/scripts/internal/init-db.sh"
+  [ -f "$db" ] || bash "$init" "$team" >/dev/null
+  case "$pos" in ''|*[!0-9]*) pos=0 ;; esac
+  tl="$(agmsg_sqlesc "$team")"; al="$(agmsg_sqlesc "$agent")"
+  agmsg_sqlite "$db" "
+    INSERT INTO cursors (team, agent, pos) VALUES ('$tl', '$al', $pos)
+    ON CONFLICT(team, agent) DO UPDATE SET pos=excluded.pos;
+  " 2>/dev/null || true
+}
+
 # storage_watch_tip <team> — current high-water cursor for the team's store
 # (the newest message id). A fresh watcher starts here so it streams only what
 # arrives next (no replay of history).

@@ -154,6 +154,33 @@ teardown() {
   [[ ! "$output" =~ "w1" ]]
 }
 
+@test "storage driver (sqlite): read cursor get/set round-trip, per-pair" {
+  source "$SCRIPTS/lib/storage.sh"
+  export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
+  agmsg_storage_load t
+  [ "$(storage_get_cursor t bob)" = "0" ]
+  storage_set_cursor t bob 42
+  [ "$(storage_get_cursor t bob)" = "42" ]
+  [ "$(storage_get_cursor t alice)" = "0" ]   # per-pair isolation
+  storage_set_cursor t bob 99                   # upsert
+  [ "$(storage_get_cursor t bob)" = "99" ]
+}
+
+@test "storage driver (jsonl): read cursor get/set round-trip, per-pair" {
+  if ! command -v jq >/dev/null 2>&1; then skip "jq not installed"; fi
+  source "$SCRIPTS/lib/storage.sh"
+  unset AGMSG_STORAGE_PATH
+  mkdir -p "$TEST_SKILL_DIR/teams/jc"
+  printf '%s\n' '{"name":"jc","storage":"jsonl"}' > "$TEST_SKILL_DIR/teams/jc/config.json"
+  agmsg_storage_load jc
+  [ "$(storage_get_cursor jc bob)" = "0" ]
+  storage_set_cursor jc bob 7
+  [ "$(storage_get_cursor jc bob)" = "7" ]
+  [ "$(storage_get_cursor jc alice)" = "0" ]
+  storage_set_cursor jc bob 12
+  [ "$(storage_get_cursor jc bob)" = "12" ]
+}
+
 @test "storage migrate: carries messages + read-state to jsonl and purges the source" {
   if ! command -v jq >/dev/null 2>&1; then skip "jq not installed"; fi
   source "$SCRIPTS/lib/storage.sh"
