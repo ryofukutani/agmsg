@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck disable=SC1091
-source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
 # Check inbox across all teams with cooldown. Skips if last check was < 60 seconds ago.
 # Usage: check-inbox.sh <type> <project_path>
@@ -42,17 +40,11 @@ if echo "$INPUT" | grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' 2>/
 fi
 
 # Defer to the monitor watcher when one is alive for this session.
-# Avoids double-delivery when delivery.mode = both. The session id field name
-# differs by vendor: Claude Code emits snake_case "session_id"; Grok Build (and
-# Cursor) emit camelCase "sessionId". Try snake first (claude-code unaffected),
-# then camel, then the GROK_SESSION_ID env Grok injects into every hook.
+# Avoids double-delivery when delivery.mode = both. session_id is sent in
+# the hook input JSON for Stop events.
 SESSION_ID=$(printf '%s' "$INPUT" \
   | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)
-[ -z "$SESSION_ID" ] && SESSION_ID=$(printf '%s' "$INPUT" \
-  | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-  | head -1)
-[ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
 if [ -n "$SESSION_ID" ]; then
   # The monitor watcher keys its pidfile (and its actas owner, below) on the
   # per-process instance id (#93), not the bare session_id. Normalize to the
@@ -70,10 +62,7 @@ fi
 
 # Identify agent and teams
 WHOAMI=$("$SCRIPT_DIR/whoami.sh" "$PROJECT" "$TYPE")
-# suggest=true means this identity is registered only under a DIFFERENT
-# project, so it is not joined here -> deliver nothing (mirror not_joined).
-# Without this the else-branch extracts "agents=" as the agent name.
-if echo "$WHOAMI" | grep -Eq "not_joined=true|suggest=true"; then
+if echo "$WHOAMI" | grep -q "not_joined=true"; then
   exit 0
 fi
 
@@ -81,8 +70,7 @@ fi
 if echo "$WHOAMI" | grep -q "multiple=true"; then
   AGENT=$(echo "$WHOAMI" | sed -n 's/.*agents=\([^,]*\).*/\1/p')
 else
-  # Anchor on a leading "agent=" so "agents=" (multiple/suggest) cannot match.
-  AGENT=$(echo "$WHOAMI" | sed -n 's/^agent=\([^ ]*\).*/\1/p')
+  AGENT=$(echo "$WHOAMI" | sed -n 's/.*agent=\([^ ]*\).*/\1/p')
 fi
 TEAMS=$(echo "$WHOAMI" | sed -n 's/.*teams=\([^ ]*\).*/\1/p')
 
@@ -97,7 +85,11 @@ fi
 MARKER="$SKILL_DIR/run/.lastcheck-$AGENT"
 
 if [ -f "$MARKER" ]; then
-  last=$(compat_file_mtime "$MARKER")
+  if [ "$(uname)" = "Darwin" ]; then
+    last=$(stat -f %m "$MARKER")
+  else
+    last=$(stat -c %Y "$MARKER")
+  fi
   now=$(date +%s)
   # Prefer the new delivery.turn.check_interval; fall back to legacy
   # hook.check_interval for users who haven't migrated.
@@ -113,17 +105,21 @@ fi
 mkdir -p "$SKILL_DIR/run"
 touch "$MARKER"
 
-# Check for unread messages and mark as read
+# Check for unread messages and mark only the displayed message ids as read.
 DB="$(agmsg_db_path)"
 if [ ! -f "$DB" ]; then exit 0; fi
 
-_agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
-AGENT_SQL="$(_agmsg_sqlesc "$AGENT")"
-
 OUTPUT=""
+IDS_FILES=()
+cleanup_ids() {
+  if [ "${#IDS_FILES[@]}" -gt 0 ]; then
+    rm -f "${IDS_FILES[@]}"
+  fi
+}
+trap cleanup_ids EXIT
+
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
-  team_sql="$(_agmsg_sqlesc "$team")"
   # Honor actas exclusivity locks. If (team, AGENT) is currently held by
   # another live session, that session is the owner of that role's inbox —
   # don't deliver here. Mirrors the per-pair filtering watch.sh does for
@@ -140,20 +136,14 @@ for team in "${TEAM_LIST[@]}"; do
     other:*) continue ;;
   esac
 
-  RESULT=$(agmsg_sqlite "$DB" "
-    SELECT from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
-    FROM messages WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL
-    ORDER BY created_at ASC;
-  ")
+  IDS_FILE="$(mktemp "${TMPDIR:-/tmp}/agmsg-check-inbox-ids.XXXXXX")"
+  IDS_FILES+=("$IDS_FILE")
+  RESULT=$("$SCRIPT_DIR/inbox-peek.sh" "$team" "$AGENT" --quiet --ids-file "$IDS_FILE")
   if [ -n "$RESULT" ]; then
-    COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
-    OUTPUT+="$COUNT new message(s) in $team:"$'\n'
-    while IFS=$'\x1f' read -r from body ts; do
-      OUTPUT+="  [$ts] $from: $body"$'\n'
-    done <<< "$RESULT"
+    OUTPUT+="Messages for $team/$AGENT:"$'\n'
+    OUTPUT+="$RESULT"$'\n'
     OUTPUT+=$'\n'
-    # Mark as read
-    agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$team_sql' AND to_agent='$AGENT_SQL' AND read_at IS NULL;" 2>/dev/null || true
+    "$SCRIPT_DIR/mark-read.sh" "$team" "$AGENT" --ids-file "$IDS_FILE"
   fi
 done
 
