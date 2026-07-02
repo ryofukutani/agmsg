@@ -72,6 +72,21 @@ run_script() {
   bash "$SCRIPT_DIR/../$script" "$@"
 }
 
+run_type_actas_hook() {
+  local name="$1"
+  local hook="$SCRIPT_DIR/../drivers/types/$AGENT_TYPE/actas-monitor.sh"
+  local status
+  [ -x "$hook" ] || return 0
+
+  set +e
+  "$hook" "$PROJECT" "$AGENT_TYPE" "$name" "${CODEX_THREAD_ID:-}"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    echo "warning: actas monitor hook failed for '$name' (status=$status)" >&2
+  fi
+}
+
 require_args() {
   local usage_text="$1"
   local min="$2"
@@ -257,9 +272,9 @@ case "$COMMAND" in
     run_script reset.sh "$PROJECT" "$AGENT_TYPE" "$1"
     ;;
 
-  actas)
-    require_args "agmsg actas <agent>" 1 "$@"
-    name="$1"
+	actas)
+	    require_args "agmsg actas <agent>" 1 "$@"
+	    name="$1"
     resolve_identity 1 0
     team_name="$(first_team "$RESOLVED_TEAM")"
 
@@ -273,12 +288,13 @@ case "$COMMAND" in
       fi
     done <<< "$identities"
 
-    if [ "$found" -eq 0 ]; then
-      run_script join.sh "$team_name" "$name" "$AGENT_TYPE" "$PROJECT"
-    fi
-    echo "To act as '$name' in this PowerShell session, run:"
-    echo "  \$env:AGMSG_TEAM = '$team_name'; \$env:AGMSG_AGENT = '$name'"
-    ;;
+	    if [ "$found" -eq 0 ]; then
+	      run_script join.sh "$team_name" "$name" "$AGENT_TYPE" "$PROJECT"
+	    fi
+	    run_type_actas_hook "$name"
+	    echo "To act as '$name' in this PowerShell session, run:"
+	    echo "  \$env:AGMSG_TEAM = '$team_name'; \$env:AGMSG_AGENT = '$name'"
+	    ;;
 
   *)
     echo "Unknown agmsg command: $COMMAND" >&2
