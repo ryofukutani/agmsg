@@ -80,6 +80,14 @@ while IFS= read -r team; do
   claimed="${claimed:+$claimed$'\n'}$team"
 done <<< "$TEAMS"
 
+# Persist the chosen lane name by the STABLE session UUID (pid stripped) so
+# session-start.sh re-narrows the watcher to this name on every resume/compact
+# without any manual step (Ryo 2026-06-30 noise fix). INSTANCE_ID carries a
+# per-process pid that changes each resume, so the durable key is the base UUID.
+_an_base="${SESSION_ID%%.*}"
+mkdir -p "$SKILL_DIR/run" 2>/dev/null || true
+printf '%s\n' "$NAME" > "$SKILL_DIR/run/active_name.$_an_base" 2>/dev/null || true
+
 # Print a line describing each claimed team. One team per most projects but
 # the underlying model allows multi-team same-name registrations.
 printf 'status=ok'
