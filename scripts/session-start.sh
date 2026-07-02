@@ -244,6 +244,23 @@ WATCH="$SKILL_DIR/scripts/watch.sh"
 # safely for shell re-execution (#188).
 WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
 
+# Narrow the re-armed watcher to this session's chosen lane, persisted across
+# resume/compact (Ryo 2026-06-30 noise fix). Keyed by the STABLE session UUID
+# (SESSION_ID), not the pid-bound INSTANCE_ID, so the preference survives the
+# pid change on every resume. Without this, the directive is always emitted
+# with the broad subscription (no active_name) and the watcher re-subscribes to
+# ALL identities of this type, so cross-lane traffic floods every session.
+# Set the preference with:  echo <name> > "$SKILL_DIR/run/active_name.<session-uuid>"
+# Absent file → ACTIVE_NAME empty → broad behavior unchanged (backward compat).
+ACTIVE_NAME=""
+_an_pref="$RUN_DIR/active_name.$SESSION_ID"
+if [ -f "$_an_pref" ]; then
+  ACTIVE_NAME="$(head -1 "$_an_pref" 2>/dev/null | tr -d '[:space:]')"
+fi
+if [ -n "$ACTIVE_NAME" ]; then
+  WATCH_COMMAND="$WATCH_COMMAND $(printf '%q' "$ACTIVE_NAME")"
+fi
+
 cat <<EOF
 AGMSG monitor mode: invoke the Monitor tool now with the following parameters,
 before any other action in this session.
