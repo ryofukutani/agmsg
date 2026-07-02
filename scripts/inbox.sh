@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage: inbox.sh <team> <agent_id> [--quiet]
-# Shows unread messages and marks them as read.
+# Shows unread messages and marks the displayed message ids as read.
 # --quiet: only output if there are unread messages (for hooks)
 
 TEAM="${1:?Usage: inbox.sh <team> <agent_id> [--quiet]}"
@@ -13,36 +13,13 @@ if [ "${3:-}" = "--quiet" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/lib/storage.sh"
-DB="$(agmsg_db_path)"
+IDS_FILE="$(mktemp "${TMPDIR:-/tmp}/agmsg-inbox-ids.XXXXXX")"
+trap 'rm -f "$IDS_FILE"' EXIT
 
-if [ ! -f "$DB" ]; then
-  if [ "$QUIET" = true ]; then exit 0; fi
-  echo "No messages (DB not initialized)"
-  exit 0
+if [ "$QUIET" = true ]; then
+  "$SCRIPT_DIR/inbox-peek.sh" "$TEAM" "$AGENT" --quiet --ids-file "$IDS_FILE"
+else
+  "$SCRIPT_DIR/inbox-peek.sh" "$TEAM" "$AGENT" --ids-file "$IDS_FILE"
 fi
 
-# Get unread messages — escape newlines/tabs in body to keep one record per line
-UNREAD=$(agmsg_sqlite "$DB" "
-  SELECT from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
-  FROM messages WHERE team='$TEAM' AND to_agent='$AGENT' AND read_at IS NULL
-  ORDER BY created_at ASC;
-")
-
-if [ -z "$UNREAD" ]; then
-  if [ "$QUIET" = true ]; then exit 0; fi
-  echo "No new messages."
-  exit 0
-fi
-
-# Display
-COUNT=$(echo "$UNREAD" | wc -l | tr -d ' ')
-echo "$COUNT new message(s):"
-echo ""
-while IFS=$'\x1f' read -r from body ts; do
-  echo "  [$ts] $from: $body"
-done <<< "$UNREAD"
-echo ""
-
-# Mark as read (non-fatal — may fail in sandboxed environments)
-agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$TEAM' AND to_agent='$AGENT' AND read_at IS NULL;" 2>/dev/null || true
+"$SCRIPT_DIR/mark-read.sh" "$TEAM" "$AGENT" --ids-file "$IDS_FILE"

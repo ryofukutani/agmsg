@@ -105,11 +105,19 @@ fi
 mkdir -p "$SKILL_DIR/run"
 touch "$MARKER"
 
-# Check for unread messages and mark as read
+# Check for unread messages and mark only the displayed message ids as read.
 DB="$(agmsg_db_path)"
 if [ ! -f "$DB" ]; then exit 0; fi
 
 OUTPUT=""
+IDS_FILES=()
+cleanup_ids() {
+  if [ "${#IDS_FILES[@]}" -gt 0 ]; then
+    rm -f "${IDS_FILES[@]}"
+  fi
+}
+trap cleanup_ids EXIT
+
 IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
 for team in "${TEAM_LIST[@]}"; do
   # Honor actas exclusivity locks. If (team, AGENT) is currently held by
@@ -128,20 +136,14 @@ for team in "${TEAM_LIST[@]}"; do
     other:*) continue ;;
   esac
 
-  RESULT=$(agmsg_sqlite "$DB" "
-    SELECT from_agent || char(31) || replace(replace(body, char(10), '\n'), char(9), '\t') || char(31) || created_at
-    FROM messages WHERE team='$team' AND to_agent='$AGENT' AND read_at IS NULL
-    ORDER BY created_at ASC;
-  ")
+  IDS_FILE="$(mktemp "${TMPDIR:-/tmp}/agmsg-check-inbox-ids.XXXXXX")"
+  IDS_FILES+=("$IDS_FILE")
+  RESULT=$("$SCRIPT_DIR/inbox-peek.sh" "$team" "$AGENT" --quiet --ids-file "$IDS_FILE")
   if [ -n "$RESULT" ]; then
-    COUNT=$(echo "$RESULT" | wc -l | tr -d ' ')
-    OUTPUT+="$COUNT new message(s) in $team:"$'\n'
-    while IFS=$'\x1f' read -r from body ts; do
-      OUTPUT+="  [$ts] $from: $body"$'\n'
-    done <<< "$RESULT"
+    OUTPUT+="Messages for $team/$AGENT:"$'\n'
+    OUTPUT+="$RESULT"$'\n'
     OUTPUT+=$'\n'
-    # Mark as read
-    agmsg_sqlite "$DB" "UPDATE messages SET read_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE team='$team' AND to_agent='$AGENT' AND read_at IS NULL;" 2>/dev/null || true
+    "$SCRIPT_DIR/mark-read.sh" "$team" "$AGENT" --ids-file "$IDS_FILE"
   fi
 done
 
