@@ -237,6 +237,23 @@ EOF
   fi
 fi
 
+# --- Burst dedup: one directive per instance per startup burst. ---
+# The same session-start.sh can be registered in more than one hooks layer
+# (e.g. user-global settings.json for resume restore AND a project
+# settings.local.json managed by delivery.sh). Both fire within the same
+# SessionStart burst, before the agent has had a chance to arm a watcher, so
+# the alive-watcher guard above cannot dedup them and the agent receives the
+# Monitor directive twice. Emit at most one directive per INSTANCE_ID per 45s.
+DIRECTIVE_MARKER="$RUN_DIR/directive.$INSTANCE_ID"
+if [ -f "$DIRECTIVE_MARKER" ]; then
+  now=$(date +%s)
+  marker_age=$(( now - $(stat -f %m "$DIRECTIVE_MARKER" 2>/dev/null || stat -c %Y "$DIRECTIVE_MARKER" 2>/dev/null || echo 0) ))
+  if [ "$marker_age" -lt 45 ]; then
+    exit 0
+  fi
+fi
+touch "$DIRECTIVE_MARKER" 2>/dev/null || true
+
 WATCH="$SKILL_DIR/scripts/watch.sh"
 # Shell-quote each argv so the host can paste the command into Monitor and run
 # it verbatim. A plain '...' wrap breaks on paths with an apostrophe
